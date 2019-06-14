@@ -46,6 +46,10 @@ set(SOURCE_FILES_LOCAL
         ${SOURCE_FILES_SNI})
 
 set(SOURCE_FILES_CLIENT
+        ../depends/http-parser/http_parser.c
+        ../depends/http-parser/http_parser.h
+        ../depends/http-parser/http_parser_wrapper.c
+        ../depends/http-parser/http_parser_wrapper.h
         cache.c
         cache.h
         encrypt.c
@@ -74,6 +78,8 @@ set(SOURCE_FILES_CLIENT
         client/client.c
         client/tls_cli.c
         client/tls_cli.h
+        ws_tls_basic.c
+        ws_tls_basic.h
         text_in_color.c
         text_in_color.h
         dump_info.c
@@ -96,6 +102,12 @@ set(SOURCE_FILES_TUNNEL
         tunnel.c)
 
 set(SOURCE_FILES_SERVER
+        ../depends/http-parser/http_parser.c
+        ../depends/http-parser/http_parser.h
+        ../depends/http-parser/http_parser_wrapper.c
+        ../depends/http-parser/http_parser_wrapper.h
+        ws_tls_basic.c
+        ws_tls_basic.h
         text_in_color.c
         text_in_color.h
         dump_info.c
@@ -122,7 +134,6 @@ set(SOURCE_FILES_SERVER
         tunnel.c
         tunnel.h
         server/server.c
-        server/server.h
         ${SOURCE_FILES_OBFS})
 
 set(SOURCE_FILES_MANAGER
@@ -154,6 +165,7 @@ include_directories(${libudns_include_dirs})
 include_directories(${libsodium_include_dirs})
 include_directories(${LIB_JSON_C_DIR}/..)
 include_directories(${PCRE_INCLUDE_DIR})
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../depends/http-parser)
 
 if(USE_CRYPTO_MBEDTLS)
     include_directories(${MBEDTLS_ROOT_DIR}/include)

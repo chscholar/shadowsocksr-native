@@ -16,6 +16,9 @@
 #include "tunnel.h"
 #include "daemon_wrapper.h"
 #include "cmd_line_parser.h"
+#include "ssrutils.h"
+#include "ws_tls_basic.h"
+#include "http_parser_wrapper.h"
 
 #ifndef SSR_MAX_CONN
 #define SSR_MAX_CONN 1024
@@ -42,6 +45,7 @@ enum tunnel_stage {
     tunnel_stage_resolve_host = 4,  /* Resolve the hostname             */
     tunnel_stage_connect_host,
     tunnel_stage_launch_streaming,
+    tunnel_stage_tls_client_feedback,
     tunnel_stage_streaming,  /* Stream between client and server */
 };
 
@@ -54,6 +58,7 @@ struct server_ctx {
     size_t _overhead;
     size_t _recv_buffer_size;
     size_t _recv_d_max_size;
+    char *sec_websocket_key;
 };
 
 struct address_timestamp {
@@ -70,7 +75,7 @@ void server_shutdown(struct server_env_t *env);
 void signal_quit_cb(uv_signal_t *handle, int signum);
 void tunnel_incoming_connection_established_cb(uv_stream_t *server, int status);
 
-static void tunnel_dying(struct tunnel_ctx *tunnel);
+static void tunnel_dying(struct tunnel_ctx *tunnel, void *p);
 static void tunnel_timeout_expire_done(struct tunnel_ctx *tunnel, struct socket_ctx *socket);
 static void tunnel_outgoing_connected_done(struct tunnel_ctx *tunnel, struct socket_ctx *socket);
 static void tunnel_read_done(struct tunnel_ctx *tunnel, struct socket_ctx *socket);
@@ -92,11 +97,15 @@ static void do_connect_host_start(struct tunnel_ctx *tunnel, struct socket_ctx *
 static void do_connect_host_done(struct tunnel_ctx *tunnel, struct socket_ctx *socket);
 static void do_launch_streaming(struct tunnel_ctx *tunnel, struct socket_ctx *socket);
 
+static void do_tls_init_package(struct tunnel_ctx *tunnel, struct socket_ctx *socket);
+static void do_tls_client_feedback(struct tunnel_ctx *tunnel);
+static void do_tls_launch_streaming(struct tunnel_ctx *tunnel, struct socket_ctx *socket);
+
 static int resolved_ips_compare_key(const void *left, const void *right);
 static void resolved_ips_destroy_object(void *obj);
 
 void print_server_info(const struct server_config *config);
-static void usage(void);
+static void svr_usage(void);
 
 int main(int argc, char * const argv[]) {
     struct server_config *config = NULL;
@@ -159,7 +168,7 @@ int main(int argc, char * const argv[]) {
     config_release(config);
 
     if (err != 0) {
-        usage();
+        svr_usage();
     }
 #if __MEM_CHECK__
     _CrtDumpMemoryLeaks();
@@ -274,7 +283,7 @@ bool _init_done_cb(struct tunnel_ctx *tunnel, void *p) {
     ctx->_recv_buffer_size = TCP_BUF_SIZE_MAX;
     tunnel->data = ctx;
 
-    tunnel->tunnel_dying = &tunnel_dying;
+    tunnel_add_dying_cb(tunnel, &tunnel_dying, ctx);
     tunnel->tunnel_timeout_expire_done = &tunnel_timeout_expire_done;
     tunnel->tunnel_outgoing_connected_done = &tunnel_outgoing_connected_done;
     tunnel->tunnel_read_done = &tunnel_read_done;
@@ -337,20 +346,25 @@ void tunnel_incoming_connection_established_cb(uv_stream_t *server, int status) 
     server_tunnel_initialize((uv_tcp_t *)server, env->config->idle_timeout);
 }
 
-static void tunnel_dying(struct tunnel_ctx *tunnel) {
+static void tunnel_dying(struct tunnel_ctx *tunnel, void *p) {
     struct server_ctx *ctx = (struct server_ctx *) tunnel->data;
+    struct server_ctx *ctx2 = (struct server_ctx *) p;
+
+    ASSERT(ctx = ctx2);
 
     cstl_set_container_remove(ctx->env->tunnel_set, tunnel);
     if (ctx->cipher) {
         tunnel_cipher_release(ctx->cipher);
     }
     buffer_release(ctx->init_pkg);
+    if (ctx->sec_websocket_key) { free(ctx->sec_websocket_key); }
     free(ctx);
 }
 
 static void do_next(struct tunnel_ctx *tunnel, struct socket_ctx *socket) {
     bool done = false;
     struct server_ctx *ctx = (struct server_ctx *)tunnel->data;
+    struct server_config *config = ctx->env->config;
     struct socket_ctx *incoming = tunnel->incoming;
     switch (ctx->stage) {
     case tunnel_stage_initial:
@@ -358,6 +372,10 @@ static void do_next(struct tunnel_ctx *tunnel, struct socket_ctx *socket) {
         ASSERT(incoming->rdstate == socket_done);
         ASSERT(incoming->wrstate == socket_stop);
         incoming->rdstate = socket_stop;
+        if (config->over_tls_enable) {
+            do_tls_init_package(tunnel, incoming);
+            break;
+        }
         do_init_package(tunnel, incoming);
         break;
     case tunnel_stage_receipt_done:
@@ -390,6 +408,12 @@ static void do_next(struct tunnel_ctx *tunnel, struct socket_ctx *socket) {
         break;
     case tunnel_stage_launch_streaming:
         do_launch_streaming(tunnel, socket);
+        break;
+    case tunnel_stage_tls_client_feedback:
+        ASSERT(incoming == socket);
+        ASSERT(incoming->wrstate == socket_done);
+        incoming->wrstate = socket_stop;
+        do_tls_launch_streaming(tunnel, socket);
         break;
     case tunnel_stage_streaming:
         tunnel_traditional_streaming(tunnel, socket);
@@ -626,7 +650,7 @@ static void do_handshake(struct tunnel_ctx *tunnel, struct socket_ctx *socket) {
     UNREACHABLE();
 }
 
-static void do_parse(struct tunnel_ctx *tunnel, struct socket_ctx *incoming) {
+static void do_parse(struct tunnel_ctx *tunnel, struct socket_ctx *socket) {
     /*
      * Shadowsocks TCP Relay Header, same as SOCKS5:
      *
@@ -656,7 +680,7 @@ static void do_parse(struct tunnel_ctx *tunnel, struct socket_ctx *incoming) {
     bool ipFound = true;
     struct buffer_t *init_pkg = ctx->init_pkg;
 
-    ASSERT(incoming == tunnel->incoming);
+    ASSERT(socket == tunnel->incoming);
 
     // get remote addr and port
     s5addr = tunnel->desired_addr;
@@ -771,6 +795,7 @@ static void do_connect_host_done(struct tunnel_ctx *tunnel, struct socket_ctx *s
     struct socket_ctx *outgoing;
 
     struct server_ctx *ctx = (struct server_ctx *) tunnel->data;
+    struct server_config *config = ctx->env->config;
 
     incoming = tunnel->incoming;
     outgoing = tunnel->outgoing;
@@ -780,6 +805,12 @@ static void do_connect_host_done(struct tunnel_ctx *tunnel, struct socket_ctx *s
     ASSERT(incoming->wrstate == socket_stop);
     ASSERT(outgoing->rdstate == socket_stop);
     ASSERT(outgoing->wrstate == socket_stop);
+
+    if (config->over_tls_enable) {
+        ASSERT(ctx->init_pkg->len == 0);
+        do_tls_client_feedback(tunnel);
+        return;
+    }
 
     if (outgoing->result == 0) {
         struct buffer_t *init_pkg = ctx->init_pkg;
@@ -824,9 +855,108 @@ static void do_launch_streaming(struct tunnel_ctx *tunnel, struct socket_ctx *so
     ctx->stage = tunnel_stage_streaming;
 }
 
+static void do_tls_init_package(struct tunnel_ctx *tunnel, struct socket_ctx *socket) {
+    struct server_ctx *ctx = (struct server_ctx *) tunnel->data;
+    struct server_config *config = ctx->env->config;
+    struct buffer_t *receipt = NULL;
+    struct buffer_t *confirm = NULL;
+    struct buffer_t *result = NULL;
+    struct http_headers *hdrs = NULL;
+    do {
+        uint8_t *indata = (uint8_t *)socket->buf->base;
+        size_t len = (size_t)socket->result;
+        size_t tcp_mss = _update_tcp_mss(socket);
+
+        ASSERT(socket == tunnel->incoming);
+        ASSERT(config->over_tls_enable); (void)config;
+
+        if (socket->result < 0) {
+            tunnel_shutdown(tunnel);
+            break;
+        }
+
+        ASSERT(ctx->cipher == NULL);
+        ctx->cipher = tunnel_cipher_create(ctx->env, tcp_mss);
+        ctx->_tcp_mss = tcp_mss;
+
+        hdrs = http_headers_parse(1, indata, len);
+        {
+            const char *key = http_headers_get_field_val(hdrs, SEC_WEBSOKET_KEY);
+            const char *url = http_headers_get_url(hdrs);
+            if (key==NULL || url==NULL || 0 != strcmp(url, config->over_tls_path)) {
+                tunnel_shutdown(tunnel);
+                break;
+            }
+            ctx->sec_websocket_key = (char *) calloc(strlen(key) + 1, sizeof(char));
+            strcpy(ctx->sec_websocket_key, key);
+        }
+        {
+            const uint8_t *data = extract_http_body(indata, len, &len);
+            BUFFER_CONSTANT_INSTANCE(buf, data, len);
+            result = tunnel_tls_cipher_server_decrypt(ctx->cipher, buf, &receipt, &confirm);
+        }
+        ASSERT(receipt == NULL);
+        ASSERT(confirm == NULL);
+
+        ASSERT(result /* && result->len!=0 */);
+        if (is_legal_header(result) == false) {
+            tunnel_shutdown(tunnel);
+            break;
+        }
+        buffer_replace(ctx->init_pkg, result);
+
+        do_prepare_parse(tunnel, socket);
+        break;
+    } while (0);
+    http_headers_destroy(hdrs);
+    buffer_release(result);
+}
+
+static void do_tls_client_feedback(struct tunnel_ctx *tunnel) {
+    struct server_ctx *ctx = (struct server_ctx *) tunnel->data;
+    struct server_config *config = ctx->env->config;
+    struct socket_ctx *incoming = tunnel->incoming;
+    char *calc_val = websocket_generate_sec_websocket_accept(ctx->sec_websocket_key, &malloc);
+    char tls_ok[0x100] = { 0 };
+    sprintf(tls_ok, WEBSOCKET_RESPONSE, calc_val);
+    free(calc_val);
+
+    ASSERT(config->over_tls_enable); (void)config;
+
+    socket_write(incoming, tls_ok, strlen(tls_ok));
+
+    ctx->stage = tunnel_stage_tls_client_feedback;
+}
+
+static void do_tls_launch_streaming(struct tunnel_ctx *tunnel, struct socket_ctx *socket) {
+    struct server_ctx *ctx = (struct server_ctx *) tunnel->data;
+    struct server_config *config = ctx->env->config;
+    struct socket_ctx *incoming = tunnel->incoming;
+    struct socket_ctx *outgoing = tunnel->outgoing;
+
+    ASSERT(config->over_tls_enable); (void)config;
+
+    ASSERT(incoming == socket);
+    ASSERT(incoming->rdstate == socket_stop);
+    ASSERT(incoming->wrstate == socket_stop);
+    ASSERT(outgoing->rdstate == socket_stop);
+    ASSERT(outgoing->wrstate == socket_stop);
+
+    if (incoming->result < 0) {
+        pr_err("write error: %s", uv_strerror((int)incoming->result));
+        tunnel_shutdown(tunnel);
+        return;
+    }
+
+    socket_read(incoming, false);
+    socket_read(outgoing, true);
+    ctx->stage = tunnel_stage_streaming;
+}
+
 static uint8_t* tunnel_extract_data(struct socket_ctx *socket, void*(*allocator)(size_t size), size_t *size) {
     struct tunnel_ctx *tunnel = socket->tunnel;
     struct server_ctx *ctx = (struct server_ctx *) tunnel->data;
+    struct server_config *config = ctx->env->config;
     struct tunnel_cipher_ctx *cipher_ctx = ctx->cipher;
     enum ssr_error error = ssr_error_client_decode;
     struct buffer_t *buf = NULL;
@@ -840,11 +970,28 @@ static uint8_t* tunnel_extract_data(struct socket_ctx *socket, void*(*allocator)
     {
         BUFFER_CONSTANT_INSTANCE(src, socket->buf->base, socket->result);
         if (socket == tunnel->outgoing) {
-            buf = tunnel_cipher_server_encrypt(cipher_ctx, src);
+            if (config->over_tls_enable) {
+                struct buffer_t *tmp = tunnel_tls_cipher_server_encrypt(cipher_ctx, src);
+                size_t frame_len = 0;
+                uint8_t *frame = websocket_build_frame(false, tmp->buffer, tmp->len, &malloc, &frame_len);
+                buf = buffer_create_from(frame, frame_len);
+                free(frame);
+                buffer_release(tmp);
+            } else {
+                buf = tunnel_cipher_server_encrypt(cipher_ctx, src);
+            }
         } else if (socket == tunnel->incoming) {
             struct buffer_t *receipt = NULL;
             struct buffer_t *confirm = NULL;
-            buf = tunnel_cipher_server_decrypt(cipher_ctx, src, &receipt, &confirm);
+            if (config->over_tls_enable) {
+                size_t payload_len = 0;
+                uint8_t *payload = websocket_retrieve_payload(src->buffer, src->len, &malloc, &payload_len);
+                BUFFER_CONSTANT_INSTANCE(payload_buf, payload, payload_len);
+                buf = tunnel_tls_cipher_server_decrypt(cipher_ctx, payload_buf, &receipt, &confirm);
+                free(payload);
+            } else {
+                buf = tunnel_cipher_server_decrypt(cipher_ctx, src, &receipt, &confirm);
+            }
             ASSERT(receipt == NULL);
             ASSERT(confirm == NULL);
         } else {
@@ -892,10 +1039,17 @@ void print_server_info(const struct server_config *config) {
     if (config->obfs_param && strlen(config->obfs_param)) {
         pr_info("obfs_param       %s", config->obfs_param);
     }
+    if (config->over_tls_enable) {
+        pr_info(" ");
+        pr_warn("over TLS         %s", config->over_tls_enable ? "yes" : "no");
+        pr_info("over TLS domain  %s", config->over_tls_server_domain);
+        pr_info("over TLS path    %s", config->over_tls_path);
+        pr_info(" ");
+    }
     pr_info("udp relay        %s\n", config->udp ? "yes" : "no");
 }
 
-static void usage(void) {
+static void svr_usage(void) {
     printf("ShadowsocksR native server\n"
         "\n"
         "Usage:\n"
